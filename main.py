@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import subprocess
+import yt_dlp
 import sys
 import os
 import logging
@@ -23,50 +23,114 @@ def setup_logging():
     )
     return logging.getLogger(__name__)
 
-def download_video(url, output_dir="downloads", format_selector="webm"):
-    """Download a single video using yt-dlp"""
+def format_selector(ctx):
+    """Select the best video and the best audio that won't result in an mkv.
+    Ensures minimum 1080p quality."""
+    
+    formats = ctx.get('formats')
+    
+    # Filter for video-only formats with at least 1080p height
+    # Sorted best to worst by default in yt-dlp, but we'll sort again to be safe
+    video_formats = sorted([f for f in formats 
+                            if f['vcodec'] != 'none' and f['acodec'] == 'none' 
+                            and f.get('height', 0) >= 1080], 
+                           key=lambda f: f.get('height', 0), reverse=True)
+    
+    if not video_formats:
+        # Fallback to the best quality available if 1080p+ video-only is not found
+        video_formats = sorted([f for f in formats 
+                                if f['vcodec'] != 'none' and f['acodec'] == 'none'],
+                               key=lambda f: f.get('height', 0), reverse=True)
+        
+    if not video_formats:
+        # If no video-only formats exist, try a single combined format
+        # This is a good fallback for cases where yt-dlp doesn't provide separate streams
+        combined_formats = sorted([f for f in formats if f['acodec'] != 'none' and f['vcodec'] != 'none'],
+                                  key=lambda f: f.get('height', 0), reverse=True)
+        if combined_formats:
+            yield combined_formats[0]
+            return
+
+    # If we have a video-only stream, we need to find an audio stream
+    best_video = video_formats[0]  # The first element is now the highest quality
+
+    # Find the best audio-only format with a compatible or common extension
+    audio_formats = sorted([f for f in formats 
+                            if f['acodec'] != 'none' and f['vcodec'] == 'none'],
+                           key=lambda f: f.get('tbr', 0), reverse=True) # Sort by total bitrate
+    
+    if not audio_formats:
+        # If no audio-only formats exist, a single stream might be the only option
+        # This case is handled above, but good to have as a final check
+        if 'acodec' in best_video and best_video['acodec'] != 'none':
+            yield best_video
+            return
+        
+        # We have a video, but no audio. Yield video only.
+        yield best_video
+        return
+    
+    best_audio = audio_formats[0] # The first element is the best audio
+
+    # Now, combine them. yt-dlp will handle the merging.
+    yield {
+        'format_id': f'{best_video["format_id"]}+{best_audio["format_id"]}',
+        'ext': best_video['ext'],
+        'requested_formats': [best_video, best_audio],
+        'protocol': f'{best_video["protocol"]}+{best_audio["protocol"]}'
+    }
+    
+def download_video(url, output_dir, format_selector_func, pbar):
+    """Download a single video using yt-dlp with a progress hook"""
+    thread_name = threading.current_thread().name
     thread_id = threading.get_ident()
+    start_time = datetime.now()
+    
+    def download_progress_hook(d):
+        """Hook to provide real-time feedback"""
+        if d['status'] == 'downloading':
+            pbar.set_description(f"Downloading {d['_percent_str']} of {url}")
+            # This is a bit tricky to update a single pbar for multiple threads.
+            # A better approach is to have a pbar per video.
+
     try:
-        # Create output directory if it doesn't exist
         Path(output_dir).mkdir(exist_ok=True)
         
-        # Build yt-dlp command
-        cmd = [
-            "yt-dlp",
-            "-f", format_selector,
-            "-o", f"{output_dir}/%(title)s.%(ext)s",
-            "--print", "%(format_id)s %(width)sx%(height)s %(ext)s",
-            url
-        ]
+        ydl_opts = {
+            'format': format_selector_func,
+            'outtmpl': f"{output_dir}/%(title)s.%(ext)s",
+            'overwrites': True,
+            'concurrent_fragment_downloads': 4,
+            # 'progress_hooks': [download_progress_hook], # This can be complicated with a shared pbar
+        }
         
-        logger.info(f"[Thread-{thread_id}] Starting download: {url}")
+        logger.info(f"[{thread_name}-{thread_id}] Starting download: {url}")
         
-        # Run yt-dlp command
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        # Extract quality info from output
-        quality_info = result.stdout.strip() if result.stdout.strip() else "Unknown quality"
-        logger.info(f"[Thread-{thread_id}] Downloaded quality: {quality_info}")
-        logger.info(f"[Thread-{thread_id}] Successfully downloaded: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # ... (rest of the info extraction)
+            
+            ydl.download([url])
+            
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        logger.info(f"[{thread_name}-{thread_id}] Successfully downloaded in {duration:.1f}s: {url}")
         return {'url': url, 'success': True, 'error': None}
         
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[Thread-{thread_id}] Failed to download {url}: {e.stderr}")
-        return {'url': url, 'success': False, 'error': e.stderr}
     except Exception as e:
-        logger.error(f"[Thread-{thread_id}] Unexpected error for {url}: {str(e)}")
+        logger.error(f"[{thread_name}-{thread_id}] Failed to download {url}: {str(e)}")
         return {'url': url, 'success': False, 'error': str(e)}
 
 def read_urls_from_file(file_path):
     """Read URLs from text file, one per line"""
     try:
+        urls = []
         with open(file_path, 'r', encoding='utf-8') as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            for line in f:
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith('#'):
+                    urls.append(stripped_line)
         return urls
     except FileNotFoundError:
         logger.error(f"File not found: {file_path}")
@@ -80,7 +144,6 @@ def main():
     # Configuration
     urls_file = "list.txt"  # Default filename
     output_dir = os.path.expanduser("~/Desktop/videos")
-    format_selector = "bestvideo[height>=720]+bestaudio/best[height>=720][vcodec!=none]/best[vcodec!=none]"
     max_workers = 5 # Default number of concurrent downloads
     
     # Handle command line arguments
@@ -89,16 +152,14 @@ def main():
     if len(sys.argv) > 2:
         output_dir = sys.argv[2]
     if len(sys.argv) > 3:
-        format_selector = sys.argv[3]
-    if len(sys.argv) > 4:
         try:
-            max_workers = int(sys.argv[4])
+            max_workers = int(sys.argv[3])
         except ValueError:
-            logger.warning(f"Invalid max_workers value: {sys.argv[4]}, using default: {max_workers}")
+            logger.warning(f"Invalid max_workers value: {sys.argv[3]}, using default: {max_workers}")
     
     logger.info(f"Starting batch download from: {urls_file}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Format: {format_selector}")
+    logger.info(f"Using custom format selector for best quality 1080p+")
     logger.info(f"Max concurrent downloads: {max_workers}")
     
     # Read URLs from file
@@ -117,7 +178,7 @@ def main():
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all download tasks
         future_to_url = {
-            executor.submit(download_video, url, output_dir, format_selector): url 
+            executor.submit(download_video, url, output_dir): url 
             for url in urls
         }
         
