@@ -5,6 +5,7 @@ description = "small python project to download youtube videos"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "lz4>=4.4.4",
     "tqdm>=4.67.1",
     "yt-dlp>=2025.8.22",
 ]
