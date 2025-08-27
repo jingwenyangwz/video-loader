@@ -8,14 +8,19 @@ from datetime import datetime
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import json
-import lz4.block
-import glob
-import subprocess
+from dotenv import load_dotenv
 
 def setup_logging():
     """Set up logging to both file and console"""
-    log_filename = f"download_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    log_dir = os.getenv("LOG_DIR", "./logs")
+    
+    # Create log directory if it doesn't exist
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    log_filename = os.path.join(log_dir, f"download_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     
     logging.basicConfig(
         level=logging.INFO,
@@ -147,6 +152,9 @@ def read_urls_from_file(file_path):
 
 def main():
     """Main function to process all URLs"""
+    # Load environment variables from .env file
+    load_dotenv()
+    
     # Configuration
     urls_file = "list.txt"  # Default filename
     output_dir = os.getenv("OUTPUT_DIR")
