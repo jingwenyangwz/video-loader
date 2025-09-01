@@ -7,7 +7,6 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 from dotenv import load_dotenv
 
 load_dotenv()
